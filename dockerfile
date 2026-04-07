@@ -1,0 +1,142 @@
+FROM apify/actor-node-playwright-chrome:18
+WORKDIR /home/myuser
+
+# Install dependencies
+RUN echo '{"name":"christian-standard-directory-scraper","version":"1.0.0","type":"module","main":"main.js","scripts":{"start":"node main.js"},"dependencies":{"apify":"^3.0.0","crawlee":"^3.0.0","playwright":"^1.40.0"},"engines":{"node":">=18.0.0"}}' > package.json
+RUN npm install --only=prod --no-optional --quiet
+
+# Write main.js directly
+RUN cat > main.js << 'ENDOFFILE'
+import { Actor } from 'apify';
+import { PlaywrightCrawler, Dataset, sleep } from 'crawlee';
+await Actor.init();
+const INPUT = await Actor.getInput() ?? {};
+const { category = 'christianchurch', stateFilter = [], maxPages = 0, delayMs = 1500 } = INPUT;
+const CATEGORY_URLS = {
+    christianchurch: 'https://christianstandard.com/places/category/christianchurch/',
+    churchofchrist: 'https://christianstandard.com/places/category/churchofchrist/',
+    missionorganization: 'https://christianstandard.com/places/category/missionorganization/',
+};
+const BASE_URL = CATEGORY_URLS[category];
+if (!BASE_URL) throw new Error('Unknown category: ' + category);
+const STATE_ABBREVS = {'Alabama':'AL','Alaska':'AK','Arizona':'AZ','Arkansas':'AR','California':'CA','Colorado':'CO','Connecticut':'CT','Delaware':'DE','Florida':'FL','Georgia':'GA','Hawaii':'HI','Idaho':'ID','Illinois':'IL','Indiana':'IN','Iowa':'IA','Kansas':'KS','Kentucky':'KY','Louisiana':'LA','Maine':'ME','Maryland':'MD','Massachusetts':'MA','Michigan':'MI','Minnesota':'MN','Mississippi':'MS','Missouri':'MO','Montana':'MT','Nebraska':'NE','Nevada':'NV','New Hampshire':'NH','New Jersey':'NJ','New Mexico':'NM','New York':'NY','North Carolina':'NC','North Dakota':'ND','Ohio':'OH','Oklahoma':'OK','Oregon':'OR','Pennsylvania':'PA','Rhode Island':'RI','South Carolina':'SC','South Dakota':'SD','Tennessee':'TN','Texas':'TX','Utah':'UT','Vermont':'VT','Virginia':'VA','Washington':'WA','West Virginia':'WV','Wisconsin':'WI','Wyoming':'WY'};
+function parseState(addressText) {
+    if (!addressText) return '';
+    const abbrevMatch = addressText.match(/,\s*([A-Z]{2})\s*\d{5}/);
+    if (abbrevMatch) return abbrevMatch[1];
+    for (const [name, abbrev] of Object.entries(STATE_ABBREVS)) {
+        if (addressText.includes(name)) return abbrev;
+    }
+    return '';
+}
+const MAX_SAFE_PAGES = maxPages > 0 ? maxPages : 500;
+const startUrls = [];
+for (let page = 1; page <= MAX_SAFE_PAGES; page++) {
+    const url = page === 1 ? BASE_URL : BASE_URL + 'page/' + page + '/';
+    startUrls.push({ url, label: 'LIST', userData: { page } });
+}
+console.log('Starting scrape of category: ' + category);
+console.log('State filter: ' + (stateFilter.length ? stateFilter.join(', ') : 'ALL STATES'));
+const crawler = new PlaywrightCrawler({
+    launchContext: { launchOptions: { headless: true } },
+    maxConcurrency: 3,
+    requestHandlerTimeoutSecs: 60,
+    maxRequestRetries: 3,
+    async requestHandler({ request, page, enqueueLinks, log }) {
+        const { label, page: pageNum } = request.userData;
+        await sleep(delayMs);
+        if (label === 'LIST') {
+            log.info('Processing list page ' + pageNum + ': ' + request.url);
+            try {
+                await page.waitForSelector('h2 a[href*="/places/"]', { timeout: 15000 });
+            } catch {
+                log.info('No listings found on page ' + pageNum + ' — stopping.');
+                return;
+            }
+            const churchLinks = await page.evaluate(() => {
+    const links = [];
+    document.querySelectorAll('h2 a[href*="/places/"]').forEach(el => {
+        const href = el.href;
+        if (href && !href.includes('/places/category/') && !href.includes('/places/search') && !href.endsWith('/places/')) {
+            links.push(href);
+        }
+    });
+    return [...new Set(links)];
+});
+            if (churchLinks.length === 0) { log.info('Pagination complete.'); return; }
+            log.info('Found ' + churchLinks.length + ' churches on page ' + pageNum);
+            for (const url of churchLinks) {
+                await enqueueLinks({ urls: [url], label: 'DETAIL', transformRequestFunction: (req) => { req.userData = { label: 'DETAIL' }; return req; } });
+            }
+        } else if (label === 'DETAIL') {
+            log.info('Scraping: ' + request.url);
+            await page.waitForSelector('.geodir-listing-detail, .gd-listing-detail, h1', { timeout: 15000 }).catch(() => {});
+            await sleep(2000);
+            const record = await page.evaluate(() => {
+                const getText = (sel) => { const el = document.querySelector(sel); return el ? el.textContent.trim() : ''; };
+                const getAttr = (sel, attr) => { const el = document.querySelector(sel); return el ? (el.getAttribute(attr) || '').trim() : ''; };
+                const name = getText('h1.page-title, h1.entry-title, h1') || document.title.split(' - ')[0];
+                const categoryEl = document.querySelector('a[href*="/places/category/"]');
+                const churchCategory = categoryEl ? categoryEl.textContent.trim() : '';
+                let streetAddress = '', city = '', stateRaw = '', zip = '', country = '';
+                const schemaAddress = document.querySelector('[itemprop="address"]');
+                if (schemaAddress) {
+                    streetAddress = getText('[itemprop="streetAddress"]');
+                    city = getText('[itemprop="addressLocality"]');
+                    stateRaw = getText('[itemprop="addressRegion"]');
+                    zip = getText('[itemprop="postalCode"]');
+                    country = getText('[itemprop="addressCountry"]');
+                }
+                const addressBlock = getText('.geodir_post_meta_address, .gd-address, .geodir-address');
+                const phoneEl = document.querySelector('a[href^="tel:"]');
+                const phone = phoneEl ? phoneEl.textContent.trim() : '';
+                const emailEl = document.querySelector('a[href^="mailto:"]');
+                const email = emailEl ? emailEl.href.replace('mailto:', '').trim() : '';
+                let website = '';
+                document.querySelectorAll('a[target="_blank"]').forEach(el => {
+                    const href = el.href || '';
+                    if (href && !href.includes('christianstandard.com') && !href.includes('facebook.com') && !href.includes('twitter.com') && !href.includes('instagram.com') && !href.includes('youtube.com') && !href.startsWith('mailto:') && !href.startsWith('tel:') && !website) { website = href; }
+                });
+                document.querySelectorAll('a').forEach(el => { if (el.textContent.trim().toLowerCase() === 'website' && !website) { website = el.href; } });
+                const facebook = getAttr('a[href*="facebook.com"]', 'href');
+                const instagram = getAttr('a[href*="instagram.com"]', 'href');
+                const youtube = getAttr('a[href*="youtube.com"]', 'href');
+                const sizeMatch = document.body.innerText.match(/Church Size:\s*([^\n]+)/);
+                const churchSize = sizeMatch ? sizeMatch[1].trim() : '';
+                const description = getText('.geodir-field-post_content, .gd-post-content, .geodir-description');
+                const staff = [];
+                const bodyText = document.body.innerText;
+                const staffBlocks = bodyText.split(/(?=Name:)/);
+                staffBlocks.forEach(block => {
+                    if (!block.includes('Name:')) return;
+                    const nameMatch = block.match(/Name:\s*(.+)/);
+                    const posMatch = block.match(/Position:\s*(.+)/);
+                    const emailMatch = block.match(/Email:\s*(.+)/);
+                    const phoneMatch = block.match(/Phone:\s*(.+)/);
+                    if (nameMatch) { staff.push({ name: nameMatch[1].trim(), position: posMatch ? posMatch[1].trim() : '', email: emailMatch ? emailMatch[1].trim() : '', phone: phoneMatch ? phoneMatch[1].trim() : '' }); }
+                });
+                const verified = !!document.querySelector('.geodir-verified, .gd-verified, [class*="verified"]');
+                return { name, churchCategory, streetAddress, city, stateRaw, zip, country, addressBlock, phone, email, website, facebook, instagram, youtube, churchSize, description, staff, verified, sourceUrl: window.location.href };
+            });
+            let state = record.stateRaw;
+            if (!state) state = parseState(record.addressBlock);
+            if (state.length > 2) state = STATE_ABBREVS[state] || state;
+            record.state = state.toUpperCase();
+            if (stateFilter.length > 0) {
+                const normalizedFilter = stateFilter.map(s => s.toUpperCase());
+                if (!normalizedFilter.includes(record.state)) { log.info('Skipping ' + record.name + ' — state ' + record.state); return; }
+            }
+            const output = { name: record.name, category: record.churchCategory || category, state: record.state, city: record.city, streetAddress: record.streetAddress, zip: record.zip, fullAddress: record.addressBlock || (record.streetAddress + ', ' + record.city + ', ' + record.stateRaw + ' ' + record.zip), phone: record.phone, email: record.email, website: record.website, facebook: record.facebook, instagram: record.instagram, youtube: record.youtube, churchSize: record.churchSize, description: record.description ? record.description.substring(0, 500) : '', staffCount: record.staff.length, staff: record.staff, verified: record.verified, sourceUrl: record.sourceUrl, scrapedAt: new Date().toISOString() };
+            await Dataset.pushData(output);
+            log.info('Saved: ' + output.name + ' | ' + output.city + ', ' + output.state);
+        }
+    },
+    failedRequestHandler({ request, log }) { log.error('Failed: ' + request.url); },
+});
+await crawler.run(startUrls);
+const { itemCount } = await Dataset.getInfo();
+console.log('Scrape complete. Records: ' + itemCount);
+await Actor.exit();
+ENDOFFILE
+
+CMD node main.js
