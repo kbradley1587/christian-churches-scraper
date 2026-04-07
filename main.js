@@ -147,18 +147,11 @@ const crawler = new PlaywrightCrawler({
             if (state.length > 2) state = STATE_ABBREVS[state] || state;
             record.state = state.toUpperCase();
 
-            // Log what we got regardless
-            log.info('State parsed: "' + record.state + '" for ' + record.name);
-
-            if (stateFilter.length > 0 && record.state) {
-            const normalizedFilter = stateFilter.map(s => s.toUpperCase());
-            if (!normalizedFilter.includes(record.state)) { 
-            log.info('Skipping ' + record.name + ' (' + record.state + ')'); 
-            return; 
+            if (stateFilter.length > 0) {
+                const normalizedFilter = stateFilter.map(s => s.toUpperCase());
+                if (!normalizedFilter.includes(record.state)) { log.info('Skipping ' + record.name + ' (' + record.state + ')'); return; }
         }
-    }
-
-// Save everything where state is empty too, so we can see the data
+            
 await Dataset.pushData({ ... });
 
             await Dataset.pushData({
