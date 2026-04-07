@@ -10,6 +10,9 @@ const url = 'https://christianstandard.com/places/category/christianchurch/';
 console.log('About to crawl:', url);
 
 const crawler = new PlaywrightCrawler({
+    proxyConfiguration: await Actor.createProxyConfiguration({
+        groups: ['RESIDENTIAL'],
+    }),
     launchContext: {
         launchOptions: {
             headless: true,
