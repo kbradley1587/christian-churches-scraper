@@ -15,198 +15,6 @@ const CATEGORY_URLS = {
 const BASE_URL = CATEGORY_URLS[category];
 if (!BASE_URL) throw new Error('Unknown category: ' + category);
 
-const STATE_ABBREVS = {'Alabama':'AL','Alaska':'AK','Arizona':'AZ','Arkansas':'AR','California':'CA','Colorado':'CO','Connecticut':'CT','Delaware':'DE','Florida':'FL','Georgia':'GA','Hawaii':'HI','Idaho':'ID','Illinois':'IL','Indiana':'IN','Iowa':'IA','Kansas':'KS','Kentucky':'KY','Louisiana':'LA','Maine':'ME','Maryland':'MD','Massachusetts':'MA','Michigan':'MI','Minnesota':'MN','Mississippi':'MS','Missouri':'MO','Montana':'MT','Nebraska':'NE','Nevada':'NV','New Hampshire':'NH','New Jersey':'NJ','New Mexico':'NM','New York':'NY','North Carolina':'NC','North Dakota':'ND','Ohio':'OH','Oklahoma':'OK','Oregon':'OR','Pennsylvania':'PA','Rhode Island':'RI','South Carolina':'SC','South Dakota':'SD','Tennessee':'TN','Texas':'TX','Utah':'UT','Vermont':'VT','Virginia':'VA','Washington':'WA','West Virginia':'WV','Wisconsin':'WI','Wyoming':'WY'};
-
-function parseState(addressText) {
-    if (!addressText) return '';
-    const abbrevMatch = addressText.match(/,\s*([A-Z]{2})\s*\d{5}/);
-    if (abbrevMatch) return abbrevMatch[1];
-    for (const [name, abbrev] of Object.entries(STATE_ABBREVS)) {
-        if (addressText.includes(name)) return abbrev;
-    }
-    return '';
-}
-
-const MAX_SAFE_PAGES = maxPages > 0 ? maxPages : 500;
-const startUrls = [];
-for (let page = 1; page <= MAX_SAFE_PAGES; page++) {
-    const url = page === 1 ? BASE_URL : BASE_URL + 'page/' + page + '/';
-    startUrls.push({ url, label: 'LIST', userData: { page } });
-}
-
-console.log('Starting scrape. Category: ' + category + ' | States: ' + (stateFilter.length ? stateFilter.join(', ') : 'ALL'));
-
-const crawler = new PlaywrightCrawler({
-    proxyConfiguration: await Actor.createProxyConfiguration({
-        groups: ['RESIDENTIAL'],
-    }),
-    launchContext: {
-        launchOptions: {
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
-        },
-    },
-    preNavigationHooks: [
-        async ({ page }) => {
-            await page.setExtraHTTPHeaders({
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            });
-            await page.addInitScript(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            });
-        },
-    ],
-    maxConcurrency: 2,
-    requestHandlerTimeoutSecs: 60,
-    maxRequestRetries: 3,
-
-    async requestHandler({ request, page, enqueueLinks, log }) {
-        const { label, page: pageNum } = request.userData;
-        await sleep(delayMs);
-
-        if (label === 'LIST') {
-            log.info('List page ' + pageNum + ': ' + request.url);
-            try {
-                await page.waitForSelector('h2 a[href*="/places/"]', { timeout: 15000 });
-            } catch {
-                log.info('No listings on page ' + pageNum + ' — done.');
-                return;
-            }
-            const churchLinks = await page.evaluate(() => {
-                const links = [];
-                document.querySelectorAll('h2 a[href*="/places/"]').forEach(el => {
-                    const href = el.href;
-                    if (href && !href.includes('/places/category/') && !href.endsWith('/places/')) {
-                        links.push(href);
-                    }
-                });
-                return [...new Set(links)];
-            });
-            if (churchLinks.length === 0) { log.info('No links — pagination complete.'); return; }
-            log.info('Found ' + churchLinks.length + ' churches on page ' + pageNum);
-            for (const url of churchLinks) {
-                await enqueueLinks({
-                    urls: [url],
-                    label: 'DETAIL',
-                    transformRequestFunction: (req) => { req.userData = { label: 'DETAIL' }; return req; },
-                });
-            }
-
-        } else if (label === 'DETAIL') {
-            log.info('Scraping: ' + request.url);
-            await page.waitForSelector('h1', { timeout: 15000 }).catch(() => {});
-            await sleep(2000);
-
-            const record = await page.evaluate(() => {
-    const getText = (sel) => { const el = document.querySelector(sel); return el ? el.textContent.trim() : ''; };
-
-    // Skip Cloudflare error pages
-    const bodyText = document.body.innerText;
-    if (bodyText.includes('Error code 521') || bodyText.includes('Web server is down')) {
-        return null;
-    }
-
-    const name = getText('h1') || document.title.split(' - ')[0];
-    const categoryEl = document.querySelector('a[href*="/places/category/"]');
-    const churchCategory = categoryEl ? categoryEl.textContent.trim() : '';
-
-    // Phone — exclude Christian Standard's default phone
-    const phoneEl = document.querySelector('a[href^="tel:"]');
-    const rawPhone = phoneEl ? phoneEl.textContent.trim() : '';
-    const phone = (rawPhone === '217-627-6766') ? '' : rawPhone;
-
-    // Email
-    const emailEl = document.querySelector('a[href^="mailto:"]');
-    const email = emailEl ? emailEl.href.replace('mailto:', '').trim() : '';
-
-    // Website — exclude maps, social, and christianstandard links
-    let website = '';
-    document.querySelectorAll('a[target="_blank"]').forEach(el => {
-        const href = el.href || '';
-        if (href &&
-            !href.includes('christianstandard.com') &&
-            !href.includes('facebook.com') &&
-            !href.includes('twitter.com') &&
-            !href.includes('instagram.com') &&
-            !href.includes('youtube.com') &&
-            !href.includes('maps.google.com') &&
-            !href.includes('connectmy.church') &&
-            !href.startsWith('mailto:') &&
-            !href.startsWith('tel:') &&
-            !website) {
-            website = href;
-        }
-    });
-    document.querySelectorAll('a').forEach(el => {
-        if (el.textContent.trim().toLowerCase() === 'website' && !website) {
-            const href = el.href || '';
-            if (!href.includes('maps.google.com') && !href.includes('connectmy.church')) {
-                website = href;
-            }
-        }
-    });
-
-    // Social — get church-specific links from the listing detail, not the site nav
-    // The church's own social links appear in the listing body, not the header/footer
-    const listingBody = document.querySelector('.geodir-listing-detail, .gd-listing-detail, main, article');
-    const searchScope = listingBody || document;
-    const facebook = searchScope.querySelector('a[href*="facebook.com/"][href*=".com/"]:not([href*="ChristianStandard"])')?.href || '';
-    const instagram = searchScope.querySelector('a[href*="instagram.com/"][href*=".com/"]:not([href*="christianstandard"])')?.href || '';
-    const youtube = searchScope.querySelector('a[href*="youtube.com/"][href*=".com/"]:not([href*="christianstandard"])')?.href || '';
-
-    // Google Maps URL for coordinates
-    let mapsUrl = '';
-    document.querySelectorAll('a[href*="maps.google.com"]').forEach(el => {
-        if (!mapsUrl) mapsUrl = el.href;
-    });
-    // Also check iframes
-    document.querySelectorAll('iframe[src*="maps.google.com"], iframe[src*="google.com/maps"]').forEach(el => {
-        if (!mapsUrl) mapsUrl = el.src;
-    });
-
-    // Extract lat/long from maps URL
-    let lat = null, lng = null;
-    if (mapsUrl) {
-        const llMatch = mapsUrl.match(/ll=([-\d.]+),([-\d.]+)/);
-        if (llMatch) { lat = parseFloat(llMatch[1]); lng = parseFloat(llMatch[2]); }
-        const qMatch = mapsUrl.match(/q=([-\d.]+),([-\d.]+)/);
-        if (qMatch && !lat) { lat = parseFloat(qMatch[1]); lng = parseFloat(qMatch[2]); }
-    }
-
-    // Church size
-    const sizeMatch = bodyText.match(/Church Size:\s*([^\n]+)/);
-    const churchSize = sizeMatch ? sizeMatch[1].trim() : '';
-
-    // Description
-    const description = getText('.geodir-field-post_content, .gd-post-content, .geodir-description');
-
-    // Staff
-    const staff = [];
-    const staffBlocks = bodyText.split(/(?=Name:)/);
-    staffBlocks.forEach(block => {
-        if (!block.includes('Name:')) return;
-        const nameMatch = block.match(/Name:\s*(.+)/);
-        const posMatch = block.match(/Position:\s*(.+)/);
-        const emailMatch = block.match(/Email:\s*(.+)/);
-        const phoneMatch = block.match(/Phone:\s*(.+)/);
-        if (nameMatch) {
-            staff.push({
-                name: nameMatch[1].trim(),
-                position: posMatch ? posMatch[1].trim() : '',
-                email: emailMatch ? emailMatch[1].trim() : '',
-                phone: phoneMatch ? phoneMatch[1].trim() : '',
-            });
-        }
-    });
-
-    return { name, churchCategory, phone, email, website, facebook, instagram, youtube, churchSize, description, staff, lat, lng, mapsUrl, sourceUrl: window.location.href };
-});
-
-// Skip null records (Cloudflare errors)
-if (!record) { log.info('Skipping error page: ' + request.url); return; }
-
-// Determine state from lat/long bounding boxes
 function getStateFromCoords(lat, lng) {
     if (!lat || !lng) return '';
     const states = [
@@ -268,35 +76,188 @@ function getStateFromCoords(lat, lng) {
     return '';
 }
 
-const state = getStateFromCoords(record.lat, record.lng);
-
-// Apply state filter
-if (stateFilter.length > 0 && state) {
-    const normalizedFilter = stateFilter.map(s => s.toUpperCase());
-    if (!normalizedFilter.includes(state)) {
-        log.info('Skipping ' + record.name + ' (' + state + ')');
-        return;
-    }
+const MAX_SAFE_PAGES = maxPages > 0 ? maxPages : 500;
+const startUrls = [];
+for (let page = 1; page <= MAX_SAFE_PAGES; page++) {
+    const url = page === 1 ? BASE_URL : BASE_URL + 'page/' + page + '/';
+    startUrls.push({ url, label: 'LIST', userData: { page } });
 }
 
-await Dataset.pushData({
-    name: record.name,
-    category: record.churchCategory || category,
-    state,
-    lat: record.lat,
-    lng: record.lng,
-    phone: record.phone,
-    email: record.email,
-    website: record.website,
-    facebook: record.facebook,
-    instagram: record.instagram,
-    youtube: record.youtube,
-    churchSize: record.churchSize,
-    description: record.description ? record.description.substring(0, 500) : '',
-    staffCount: record.staff.length,
-    staff: record.staff,
-    mapsUrl: record.mapsUrl,
-    sourceUrl: record.sourceUrl,
-    scrapedAt: new Date().toISOString(),
+console.log('Starting scrape. Category: ' + category + ' | States: ' + (stateFilter.length ? stateFilter.join(', ') : 'ALL'));
+
+const crawler = new PlaywrightCrawler({
+    proxyConfiguration: await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] }),
+    launchContext: {
+        launchOptions: {
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+        },
+    },
+    preNavigationHooks: [
+        async ({ page }) => {
+            await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+            await page.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            });
+        },
+    ],
+    maxConcurrency: 2,
+    requestHandlerTimeoutSecs: 60,
+    maxRequestRetries: 3,
+
+    async requestHandler({ request, page, enqueueLinks, log }) {
+        const { label, page: pageNum } = request.userData;
+        await sleep(delayMs);
+
+        if (label === 'LIST') {
+            log.info('List page ' + pageNum + ': ' + request.url);
+            try {
+                await page.waitForSelector('h2 a[href*="/places/"]', { timeout: 15000 });
+            } catch {
+                log.info('No listings on page ' + pageNum + ' — done.');
+                return;
+            }
+            const churchLinks = await page.evaluate(() => {
+                const links = [];
+                document.querySelectorAll('h2 a[href*="/places/"]').forEach(el => {
+                    const href = el.href;
+                    if (href && !href.includes('/places/category/') && !href.endsWith('/places/')) {
+                        links.push(href);
+                    }
+                });
+                return [...new Set(links)];
+            });
+            if (churchLinks.length === 0) { log.info('No links — done.'); return; }
+            log.info('Found ' + churchLinks.length + ' churches on page ' + pageNum);
+            for (const url of churchLinks) {
+                await enqueueLinks({
+                    urls: [url],
+                    label: 'DETAIL',
+                    transformRequestFunction: (req) => { req.userData = { label: 'DETAIL' }; return req; },
+                });
+            }
+
+        } else if (label === 'DETAIL') {
+            log.info('Scraping: ' + request.url);
+            await page.waitForSelector('h1', { timeout: 15000 }).catch(() => {});
+            await sleep(2000);
+
+            const record = await page.evaluate(() => {
+                const getText = (sel) => { const el = document.querySelector(sel); return el ? el.textContent.trim() : ''; };
+                const bodyText = document.body.innerText;
+
+                if (bodyText.includes('Error code 521') || bodyText.includes('Web server is down')) return null;
+
+                const name = getText('h1') || document.title.split(' - ')[0];
+                const categoryEl = document.querySelector('a[href*="/places/category/"]');
+                const churchCategory = categoryEl ? categoryEl.textContent.trim() : '';
+
+                const phoneEl = document.querySelector('a[href^="tel:"]');
+                const rawPhone = phoneEl ? phoneEl.textContent.trim() : '';
+                const phone = (rawPhone === '217-627-6766') ? '' : rawPhone;
+
+                const emailEl = document.querySelector('a[href^="mailto:"]');
+                const email = emailEl ? emailEl.href.replace('mailto:', '').trim() : '';
+
+                let website = '';
+                document.querySelectorAll('a[target="_blank"]').forEach(el => {
+                    const href = el.href || '';
+                    if (href &&
+                        !href.includes('christianstandard.com') &&
+                        !href.includes('facebook.com') &&
+                        !href.includes('twitter.com') &&
+                        !href.includes('instagram.com') &&
+                        !href.includes('youtube.com') &&
+                        !href.includes('maps.google.com') &&
+                        !href.includes('connectmy.church') &&
+                        !href.startsWith('mailto:') &&
+                        !href.startsWith('tel:') &&
+                        !website) { website = href; }
+                });
+                document.querySelectorAll('a').forEach(el => {
+                    if (el.textContent.trim().toLowerCase() === 'website' && !website) {
+                        const href = el.href || '';
+                        if (!href.includes('maps.google.com') && !href.includes('connectmy.church')) website = href;
+                    }
+                });
+
+                const facebook = document.querySelector('a[href*="facebook.com/"]:not([href*="ChristianStandard"])')?.href || '';
+                const instagram = document.querySelector('a[href*="instagram.com/"]:not([href*="christianstandard"])')?.href || '';
+                const youtube = document.querySelector('a[href*="youtube.com/"]:not([href*="christianstandard"])')?.href || '';
+
+                let mapsUrl = '';
+                document.querySelectorAll('a[href*="maps.google.com"]').forEach(el => { if (!mapsUrl) mapsUrl = el.href; });
+                document.querySelectorAll('iframe[src*="maps.google.com"], iframe[src*="google.com/maps"]').forEach(el => { if (!mapsUrl) mapsUrl = el.src; });
+
+                let lat = null, lng = null;
+                if (mapsUrl) {
+                    const llMatch = mapsUrl.match(/ll=([-\d.]+),([-\d.]+)/);
+                    if (llMatch) { lat = parseFloat(llMatch[1]); lng = parseFloat(llMatch[2]); }
+                    const qMatch = mapsUrl.match(/q=([-\d.]+),([-\d.]+)/);
+                    if (qMatch && !lat) { lat = parseFloat(qMatch[1]); lng = parseFloat(qMatch[2]); }
+                }
+
+                const sizeMatch = bodyText.match(/Church Size:\s*([^\n]+)/);
+                const churchSize = sizeMatch ? sizeMatch[1].trim() : '';
+                const description = getText('.geodir-field-post_content, .gd-post-content, .geodir-description');
+
+                const staff = [];
+                bodyText.split(/(?=Name:)/).forEach(block => {
+                    if (!block.includes('Name:')) return;
+                    const nameMatch = block.match(/Name:\s*(.+)/);
+                    const posMatch = block.match(/Position:\s*(.+)/);
+                    const emailMatch = block.match(/Email:\s*(.+)/);
+                    const phoneMatch = block.match(/Phone:\s*(.+)/);
+                    if (nameMatch) {
+                        staff.push({
+                            name: nameMatch[1].trim(),
+                            position: posMatch ? posMatch[1].trim() : '',
+                            email: emailMatch ? emailMatch[1].trim() : '',
+                            phone: phoneMatch ? phoneMatch[1].trim() : '',
+                        });
+                    }
+                });
+
+                return { name, churchCategory, phone, email, website, facebook, instagram, youtube, churchSize, description, staff, lat, lng, mapsUrl, sourceUrl: window.location.href };
+            });
+
+            if (!record) { log.info('Skipping error page: ' + request.url); return; }
+
+            const state = getStateFromCoords(record.lat, record.lng);
+
+            if (stateFilter.length > 0 && state) {
+                const normalizedFilter = stateFilter.map(s => s.toUpperCase());
+                if (!normalizedFilter.includes(state)) {
+                    log.info('Skipping ' + record.name + ' (' + state + ')');
+                    return;
+                }
+            }
+
+            await Dataset.pushData({
+                name: record.name,
+                category: record.churchCategory || category,
+                state,
+                lat: record.lat,
+                lng: record.lng,
+                phone: record.phone,
+                email: record.email,
+                website: record.website,
+                facebook: record.facebook,
+                instagram: record.instagram,
+                youtube: record.youtube,
+                churchSize: record.churchSize,
+                description: record.description ? record.description.substring(0, 500) : '',
+                staffCount: record.staff.length,
+                staff: record.staff,
+                sourceUrl: record.sourceUrl,
+                scrapedAt: new Date().toISOString(),
+            });
+            log.info('✓ Saved: ' + record.name + ' | ' + state);
+        }
+    },
+    failedRequestHandler({ request, log }) { log.error('Failed: ' + request.url); },
 });
-log.info('✓ Saved: ' + record.name + ' | state: ' + state);
+
+await crawler.run(startUrls);
+console.log('Scrape complete.');
+await Actor.exit();
